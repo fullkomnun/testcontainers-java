@@ -2,19 +2,23 @@ package org.testcontainers.containers;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.model.Container;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.google.common.util.concurrent.Uninterruptibles;
 import lombok.NonNull;
+import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.SystemUtils;
 import org.junit.runner.Description;
 import org.junit.runners.model.Statement;
 import org.slf4j.Logger;
 import org.testcontainers.DockerClientFactory;
+import org.testcontainers.UnstableAPI;
 import org.testcontainers.containers.output.OutputFrame;
 import org.testcontainers.containers.output.Slf4jLogConsumer;
 import org.testcontainers.containers.startupcheck.IndefiniteWaitOneShotStartupCheckStrategy;
@@ -35,6 +39,7 @@ import org.zeroturnaround.exec.ProcessExecutor;
 import org.zeroturnaround.exec.stream.slf4j.Slf4jStream;
 
 import java.io.File;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
@@ -52,6 +57,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import java.util.zip.Adler32;
+import java.util.zip.Checksum;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -77,6 +84,7 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
     private boolean localCompose;
     private boolean pull = true;
     private boolean build = false;
+    private boolean shouldBeReused = false;
     private boolean tailChildContainers;
 
     private String project;
@@ -159,7 +167,9 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
     @Override
     public void start() {
         synchronized (MUTEX) {
-            registerContainersForShutdown();
+            if (!canBeReused()) {
+                registerContainersForShutdown();
+            }
             if (pull) {
                 try {
                     pullImages();
@@ -188,6 +198,12 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
             });
     }
 
+    @UnstableAPI
+    public SELF withReuse(boolean reusable) {
+        this.shouldBeReused = reusable;
+        return self();
+    }
+
     public SELF withServices(@NonNull String... services) {
         this.services = Arrays.asList(services);
         return self();
@@ -200,6 +216,9 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
             .collect(joining(" "));
 
         String flags = "-d";
+        if (shouldBeReused) {
+            flags += " --no-recreate";
+        }
 
         if (build) {
             flags += " --build";
@@ -249,6 +268,9 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
         checkNotNull(composeFiles);
         checkArgument(!composeFiles.isEmpty(), "No docker compose file have been provided");
 
+        if (canBeReused()) {
+            project = checksumProjectId(cmd);
+        }
         final DockerCompose dockerCompose;
         if (localCompose) {
             dockerCompose = new LocalDockerCompose(composeFiles, project);
@@ -260,6 +282,14 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
                 .withCommand(cmd)
                 .withEnv(env)
                 .invoke();
+    }
+
+    private boolean canBeReused() {
+        final boolean environmentSupportsReuse = TestcontainersConfiguration.getInstance().environmentSupportsReuse();
+        if (shouldBeReused && !environmentSupportsReuse) {
+            log.info("Reuse was requested but the environment does not support the reuse of containers");
+        }
+        return shouldBeReused && environmentSupportsReuse;
     }
 
     private void registerContainersForShutdown() {
@@ -279,6 +309,7 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
 
     private void startAmbassadorContainers() {
         if (!ambassadorPortMappings.isEmpty()) {
+            ambassadorPortMappings.keySet().forEach(serviceInstanceName -> ambassadorContainer.addLink(new FutureContainer(this.project + "_" + serviceInstanceName), serviceInstanceName));
             ambassadorContainer.start();
         }
     }
@@ -289,6 +320,7 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
             try {
                 // shut down the ambassador container
                 ambassadorContainer.stop();
+                if (canBeReused()) return;
 
                 // Kill the services using docker-compose
                 String cmd = "down -v";
@@ -337,7 +369,7 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
         int ambassadorPort = nextAmbassadorPort.getAndIncrement();
         ambassadorPortMappings.computeIfAbsent(serviceInstanceName, __ -> new ConcurrentHashMap<>()).put(servicePort, ambassadorPort);
         ambassadorContainer.withTarget(ambassadorPort, serviceInstanceName, servicePort);
-        ambassadorContainer.addLink(new FutureContainer(this.project + "_" + serviceInstanceName), serviceInstanceName);
+        //ambassadorContainer.addLink(new FutureContainer(this.project + "_" + serviceInstanceName), serviceInstanceName);
         addWaitStrategy(serviceInstanceName, waitStrategy);
         return self();
     }
@@ -507,7 +539,28 @@ public class DockerComposeContainer<SELF extends DockerComposeContainer<SELF>> e
     }
 
     private String randomProjectId() {
-        return identifier + Base58.randomString(6).toLowerCase();
+            return identifier + Base58.randomString(6).toLowerCase();
+    }
+
+    @VisibleForTesting
+    @SneakyThrows(IOException.class)
+    long digestDockerCompose(String command) {
+        final Checksum checksum = new Adler32();
+        for (File file : composeFiles) {
+            FileUtils.checksum(file, checksum);
+        }
+
+        final String portMappingPayload = Arrays.deepToString(ambassadorPortMappings.entrySet().stream().sorted().toArray());
+        checksum.update(portMappingPayload.getBytes(), 0, portMappingPayload.length());
+        final String envPayload = Arrays.toString(env.entrySet().stream().sorted().toArray());
+        checksum.update(envPayload.getBytes(), 0, envPayload.length());
+        checksum.update(command.getBytes(), 0 , command.length());
+        return checksum.getValue();
+    }
+
+    private String checksumProjectId(String command) {
+        return StringUtils.leftPad(Long.toString(digestDockerCompose(command), Character.MAX_RADIX).toLowerCase(),
+                12, 'x');
     }
 
     public enum RemoveImages {
